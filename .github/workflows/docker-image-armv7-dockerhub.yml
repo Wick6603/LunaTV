@@ -1,0 +1,98 @@
+name: Build & Push Docker image (armv7) → Docker Hub
+
+# armv7 (linux/arm/v7, 32 位 ARM) 构建，推送到 Docker Hub。
+# 在 ubuntu-24.04-arm (arm64) runner 上通过 QEMU 用户态模拟来编译 arm/v7，
+# 相比在 x86 runner 上模拟 arm/v7 快得多（arm32 在 arm64 上无需跨架构翻译）。
+#
+# 需要仓库 Secrets：
+#   DOCKERHUB_USERNAME  -> Docker Hub 用户名（同时作为镜像命名空间）
+#   DOCKERHUB_TOKEN     -> Docker Hub 访问令牌（Access Token，不要用密码）
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Docker 标签'
+        required: false
+        default: 'latest'
+        type: string
+  push:
+    branches: [ main, master, dev ]
+  pull_request:
+    branches: [ main, master, dev ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-armv7:
+    # arm64 runner；用 QEMU 模拟 arm/v7（32 位）
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Check if version changed
+        id: version_check
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            git checkout HEAD~1 -- package.json 2>/dev/null || echo "{\"version\":\"0.0.0\"}" > package.json.old
+            PREVIOUS_VERSION=$(node -p "try { require('./package.json').version } catch(e) { '0.0.0' }")
+            git checkout HEAD -- package.json
+          else
+            PREVIOUS_VERSION="0.0.0"
+          fi
+
+          echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+            echo "version_changed=true" >> $GITHUB_OUTPUT
+            echo "Version changed: $PREVIOUS_VERSION -> $CURRENT_VERSION"
+          else
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "Version unchanged: $CURRENT_VERSION"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          # Docker Hub 命名空间即用户名；推送独立的 lunatv-armv7 仓库，避免与多架构镜像混淆
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/lunatv-armv7
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version_check.outputs.current_version }},enable=${{ steps.version_check.outputs.version_changed == 'true' }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
+
+      - name: Build and push arm/v7
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          no-cache: true
+          pull: true
